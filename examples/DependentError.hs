@@ -141,13 +141,27 @@ releaseAll dmap = DM.foldWithKey releaseOne (return ()) dmap
 class Manifest a where
   type ManifestResourceDescriptor a :: *
   resourceDescriptor :: a domain range -> ManifestResourceDescriptor a
-  mget :: a domain range -> ResourceType (ManifestResourceDescriptor a) -> domain -> IO (Maybe range)
+  -- The actual "low-level" domain and range types can depend upon
+  -- the "high-level" domain and range.
+  type ManifestDomainType a domain range :: *
+  type ManifestRangeType a domain range :: *
+  mdomainDump :: a domain range -> domain -> ManifestDomainType a domain range
+  mrangePull :: a domain range -> ManifestRangeType a domain range -> Maybe range
+  mget
+    :: a domain range
+    -> ResourceType (ManifestResourceDescriptor a)
+    -> ManifestDomainType a domain range
+    -> IO (Maybe (ManifestRangeType a domain range))
 
 data PureManifest a b = PureManifest (a -> Maybe b)
 
 instance Manifest PureManifest where
   type ManifestResourceDescriptor PureManifest = PureDescriptor
   resourceDescriptor _ = PD
+  type ManifestDomainType PureManifest domain range = domain
+  type ManifestRangeType PureManifest domain range = range
+  mdomainDump = const id
+  mrangePull = const Just
   mget (PureManifest f) () x = return $ f x
 
 data M' t where
@@ -201,8 +215,10 @@ runM term = iterM run term >>= finalize
               put $ DM.insert (Identity $ resourceDescriptor manifest) r dmap
               return r
           Just r -> return r
-        y <- liftIO $ mget manifest (resource rsrc) x
-        next y
+        y <- liftIO $ mget manifest (resource rsrc) (mdomainDump manifest x)
+        case y of
+          Nothing -> next Nothing
+          Just y' -> next (mrangePull manifest y')
 
 -- Moving forward: we need a custom monad which is
 --   IO

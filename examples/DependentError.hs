@@ -1,10 +1,14 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ConstraintKinds #-}
 
 import qualified Data.DependentMap as DM
+import qualified Data.ByteString as BS
+import qualified Data.Text as T
 import Data.Functor.Identity
 import Data.Typeable
 import Data.Monoid
@@ -14,6 +18,7 @@ import Control.Monad.Trans.State
 import Control.Monad.IO.Class
 import System.IO
 import Database.SQLite.Simple
+import GHC.Exts (Constraint)
 
 data DErrorMap
 
@@ -145,10 +150,14 @@ class Manifest a where
   -- the "high-level" domain and range.
   type ManifestDomainType a domain range :: *
   type ManifestRangeType a domain range :: *
-  mdomainDump :: a domain range -> domain -> ManifestDomainType a domain range
-  mrangePull :: a domain range -> ManifestRangeType a domain range -> Maybe range
+  type ManifestDomainConstraint a domain range :: Constraint
+  type ManifestRangeConstraint a domain range :: Constraint
+  mdomainDump :: ManifestDomainConstraint a domain range => a domain range -> domain -> ManifestDomainType a domain range
+  mrangePull :: ManifestRangeConstraint a domain range => a domain range -> ManifestRangeType a domain range -> Maybe range
   mget
-    :: a domain range
+    :: (
+       )
+    => a domain range
     -> ResourceType (ManifestResourceDescriptor a)
     -> ManifestDomainType a domain range
     -> IO (Maybe (ManifestRangeType a domain range))
@@ -160,6 +169,8 @@ instance Manifest PureManifest where
   resourceDescriptor _ = PD
   type ManifestDomainType PureManifest domain range = domain
   type ManifestRangeType PureManifest domain range = range
+  type ManifestDomainConstraint PureManifest domain range = ()
+  type ManifestRangeConstraint PureManifest domain range = ()
   mdomainDump = const id
   mrangePull = const Just
   mget (PureManifest f) () x = return $ f x
@@ -169,6 +180,8 @@ data M' t where
   MAt
     :: ( Manifest m
        , ResourceDescriptor (ManifestResourceDescriptor m)
+       , ManifestDomainConstraint m domain range
+       , ManifestRangeConstraint m domain range
        )
     => m domain range -> domain -> (Maybe range -> t) -> M' t
 
@@ -182,17 +195,13 @@ type M = Free M'
 at
   :: ( Manifest m
      , ResourceDescriptor (ManifestResourceDescriptor m)
+     , ManifestDomainConstraint m domain range
+     , ManifestRangeConstraint m domain range
      )
   => m domain range
   -> domain
   -> M (Maybe range)
 at m d = liftF (MAt m d id)
-
-exampleTerm :: M (Maybe String)
-exampleTerm = do
-  foo <- (PureManifest (\x -> Just $ show x) :: PureManifest Bool String) `at` True
-  bar <- (PureManifest (\x -> Just $ x ++ "!") :: PureManifest String String) `at` "foo"
-  return $ (++) <$> foo <*> bar
 
 runM :: M a -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO a
 runM term = iterM run term >>= finalize
@@ -229,15 +238,36 @@ runM term = iterM run term >>= finalize
 -- We should now be equipped to interpret the M monad from other examples,
 -- without assignment.
 
-{-
-data SQLiteManifest = SQLiteManifest SQLiteDescriptor String
+data SQLiteManifest domain range = SQLiteManifest SQLiteDescriptor String
+
+class TextSerializable a where
+  textSerialize :: a -> T.Text
+  textDeserialize :: T.Text -> Maybe a
+
+instance TextSerializable [Char] where
+  textSerialize = T.pack
+  textDeserialize = Just . T.unpack
 
 instance Manifest SQLiteManifest where
   type ManifestResourceDescriptor SQLiteManifest = SQLiteDescriptor
   resourceDescriptor (SQLiteManifest sqld _) = sqld
-  mget (SQLiteManifest _ tableName) conn x = do
-    y <- query conn "SELECT \"2\" FROM ? WHERE \"1\"=?" (tableName, x) :: IO [Only t]
-    case y of
+  type ManifestDomainType SQLiteManifest domain range = T.Text
+  type ManifestRangeType SQLiteManifest domain range = T.Text
+  type ManifestDomainConstraint SQLiteManifest domain range = TextSerializable domain
+  type ManifestRangeConstraint SQLiteManifest domain range = TextSerializable range
+  mdomainDump _ = textSerialize
+  mrangePull _ = textDeserialize
+  mget (SQLiteManifest _ tableName) conn key = do
+    y <- query conn "SELECT \"2\" FROM test WHERE 1=1 OR \"1\"=?" (Only key) :: IO [Only T.Text]
+    return $ case y of
       [] -> Nothing
-      (y' : _) -> Just y'
--}
+      (y' : _) -> Just (fromOnly y')
+
+
+
+exampleTerm :: M (Maybe String)
+exampleTerm = do
+  foo <- (PureManifest (\x -> Just $ show x) :: PureManifest Bool String) `at` True
+  bar <- (SQLiteManifest (SQLD "./test1.db") "test" :: SQLiteManifest String String) `at` "foo"
+  return $ (++) <$> foo <*> bar
+

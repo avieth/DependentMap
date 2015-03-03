@@ -1,4 +1,5 @@
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -7,6 +8,10 @@ import qualified Data.DependentMap as DM
 import Data.Functor.Identity
 import Data.Typeable
 import Data.Monoid
+import Control.Applicative
+import Control.Monad.Free
+import Control.Monad.Trans.State
+import Control.Monad.IO.Class
 import System.IO
 import Database.SQLite.Simple
 
@@ -144,6 +149,66 @@ instance Manifest PureManifest where
   type ManifestResourceDescriptor PureManifest = PureDescriptor
   resourceDescriptor _ = PD
   mget (PureManifest f) () x = return $ f x
+
+data M' t where
+  MPure :: t -> M' t
+  MAt
+    :: ( Manifest m
+       , ResourceDescriptor (ManifestResourceDescriptor m)
+       )
+    => m domain range -> domain -> (Maybe range -> t) -> M' t
+
+instance Functor M' where
+  fmap f m' = case m' of
+    MPure x -> MPure $ f x
+    MAt manifest x g -> MAt manifest x (fmap f g)
+
+type M = Free M'
+
+at
+  :: ( Manifest m
+     , ResourceDescriptor (ManifestResourceDescriptor m)
+     )
+  => m domain range
+  -> domain
+  -> M (Maybe range)
+at m d = liftF (MAt m d id)
+
+exampleTerm :: M (Maybe String)
+exampleTerm = do
+  foo <- (PureManifest (\x -> Just $ show x) :: PureManifest Bool String) `at` True
+  bar <- (PureManifest (\x -> Just $ x ++ "!") :: PureManifest String String) `at` "foo"
+  return $ (++) <$> foo <*> bar
+
+runM :: M a -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO a
+runM term = iterM run term >>= finalize
+  where
+
+    finalize x = do
+      dmap <- get
+      liftIO $ releaseAll dmap
+      return x
+
+    run :: M' (StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO a)
+        -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO a
+    run m' = case m' of
+      MPure io -> io
+      MAt manifest x next -> do
+        dmap <- get
+        rsrc <- case DM.lookup (Identity $ resourceDescriptor manifest) dmap of
+          Nothing -> do
+              r <- liftIO $ makeResource (resourceDescriptor manifest)
+              put $ DM.insert (Identity $ resourceDescriptor manifest) r dmap
+              return r
+          Just r -> return r
+        y <- liftIO $ mget manifest (resource rsrc) x
+        next y
+
+-- Moving forward: we need a custom monad which is
+--   IO
+--   with exceptions
+--   with state
+--   with "finalizer" which can use that state.
 
 -- We should now be equipped to interpret the M monad from other examples,
 -- without assignment.

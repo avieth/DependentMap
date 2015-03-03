@@ -31,14 +31,14 @@ import Prelude hiding (lookup)
 import Data.Typeable
 import Data.Monoid
 
-heteroEq :: forall v a b . (Eq (v a), Typeable a, Typeable b) => v a -> v b -> Bool
-heteroEq x y = case eqT :: Maybe (a :~: b) of
+heteroEqWeak :: forall v a b . (Eq (v a), Typeable a, Typeable b) => v a -> v b -> Bool
+heteroEqWeak x y = case eqT :: Maybe (a :~: b) of
   Just Refl -> x == y
   Nothing -> False
 
--- Like heteroEq, but we give the equality type in case they're equal (in type
+-- Like heteroEqWeak, but we give the equality type in case they're equal (in type
 -- and in Eq instance).
-heteroEq'
+heteroEq
   :: forall t a b .
      ( Eq (t a)
      , Typeable a
@@ -47,7 +47,7 @@ heteroEq'
   => t a
   -> t b
   -> Maybe (a :~: b)
-heteroEq' x y = case eqT :: Maybe (a :~: b) of
+heteroEq x y = case eqT :: Maybe (a :~: b) of
   Just Refl -> if x == y then Just Refl else Nothing
   Nothing -> Nothing
 
@@ -65,7 +65,6 @@ data DependentMap :: * -> (* -> *) -> (* -> *) -> * where
   DependentMapCons
     :: ( Ord (k a)
        , Typeable a
-       , Typeable b
        , b ~ DependentMapFunction t a
        )
     => k a
@@ -80,7 +79,6 @@ singleton
   :: forall t k v a b .
      ( Ord (k a)
      , Typeable a
-     , Typeable b
      , b ~ DependentMapFunction t a
      )
   => k a
@@ -92,7 +90,6 @@ insert
   :: ( Eq (k a)
      , Ord (k a)
      , Typeable a
-     , Typeable b
      , b ~ DependentMapFunction t a
      )
   => k a
@@ -101,7 +98,7 @@ insert
   -> DependentMap t k v
 insert key val dmap = case dmap of
   DependentMapNil -> DependentMapCons key val DependentMapNil
-  DependentMapCons key' val' rest -> case heteroEq key key' of
+  DependentMapCons key' val' rest -> case heteroEqWeak key key' of
     True -> DependentMapCons key val rest
     False -> DependentMapCons key' val' (insert key val rest)
 
@@ -109,7 +106,6 @@ alter
   :: forall t k v a b .
      ( Ord (k a)
      , Typeable a
-     , Typeable b
      , b ~ DependentMapFunction t a
      )
   => (Maybe (v b) -> Maybe (v b))
@@ -119,21 +115,11 @@ alter
 alter f key dmap = case f (lookup key dmap) of
   Just val -> insert key val dmap
   Nothing -> delete key dmap
-{-
-alter f key dmap = case lookup key dmap of
-  Just val -> case f (Just val) of
-    Just val' -> insert key val' dmap
-    Nothing -> delete key dmap
-  Nothing -> case f Nothing of
-    Just val' -> insert key val' dmap
-    Nothing -> dmap
--}
 
 lookup
   :: forall t k v a b c .
      ( Eq (k a)
      , Typeable a
-     , Typeable b
      , b ~ (DependentMapFunction t a)
      )
   => k a
@@ -145,9 +131,8 @@ lookup
 lookup key dmap = case dmap of
   DependentMapNil -> Nothing
   -- TODO encapsulate this as a "special eq" or perhaps "heterogeneous eq"
-  DependentMapCons key' (val :: v d) rest -> case eqT :: Maybe (d :~: (DependentMapFunction t a)) of
-    Just Refl -> if heteroEq key key' then Just val else lookup key rest
-    -- ^ Pattern matching on the Refl allows us to use the Match constructor.
+  DependentMapCons key' val rest -> case heteroEq key key' of
+    Just Refl -> Just val
     Nothing -> lookup key rest
 
 delete
@@ -159,7 +144,7 @@ delete
   -> DependentMap t k v
 delete key dmap = case dmap of
   DependentMapNil -> DependentMapNil
-  DependentMapCons key' _ rest -> if heteroEq key key' then rest else delete key dmap
+  DependentMapCons key' _ rest -> if heteroEqWeak key key' then rest else delete key dmap
 
 -- How could a fold possibly work?
 -- The provided function has to switch its behaviour based on the type
@@ -173,7 +158,6 @@ foldWithKey
   => ( forall a b .
        ( Ord (k a)
        , Typeable a
-       , Typeable b
        , b ~ DependentMapFunction t a
        )
        => k a

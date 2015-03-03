@@ -1,6 +1,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 import qualified Data.DependentMap as DM
 import Data.Functor.Identity
@@ -89,6 +90,13 @@ instance ResourceDescriptor FileDescriptor where
     h <- openFile fp ReadMode
     return $ Resource h hClose
 
+data PureDescriptor = PD
+  deriving (Eq, Ord, Typeable)
+
+instance ResourceDescriptor PureDescriptor where
+  type ResourceType PureDescriptor = ()
+  makeResource PD = return $ Resource () return
+
 data SQLiteDescriptor = SQLD String
   deriving (Eq, Ord, Typeable)
 
@@ -124,3 +132,31 @@ releaseAll :: DM.DependentMap DResourceMap DResourceKey Resource -> IO ()
 releaseAll dmap = DM.foldWithKey releaseOne (return ()) dmap
   where
     releaseOne _ res io = io >> release res
+
+class Manifest a where
+  type ManifestResourceDescriptor a :: *
+  resourceDescriptor :: a domain range -> ManifestResourceDescriptor a
+  mget :: a domain range -> ResourceType (ManifestResourceDescriptor a) -> domain -> IO (Maybe range)
+
+data PureManifest a b = PureManifest (a -> Maybe b)
+
+instance Manifest PureManifest where
+  type ManifestResourceDescriptor PureManifest = PureDescriptor
+  resourceDescriptor _ = PD
+  mget (PureManifest f) () x = return $ f x
+
+-- We should now be equipped to interpret the M monad from other examples,
+-- without assignment.
+
+{-
+data SQLiteManifest = SQLiteManifest SQLiteDescriptor String
+
+instance Manifest SQLiteManifest where
+  type ManifestResourceDescriptor SQLiteManifest = SQLiteDescriptor
+  resourceDescriptor (SQLiteManifest sqld _) = sqld
+  mget (SQLiteManifest _ tableName) conn x = do
+    y <- query conn "SELECT \"2\" FROM ? WHERE \"1\"=?" (tableName, x) :: IO [Only t]
+    case y of
+      [] -> Nothing
+      (y' : _) -> Just y'
+-}

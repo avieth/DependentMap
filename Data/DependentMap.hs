@@ -18,6 +18,8 @@ module Data.DependentMap (
 
   , DMapFunction
 
+  , DMapSimple
+
   , module Data.Typeable
 
   ) where
@@ -168,3 +170,8 @@ dSize dmap = dFoldWithKey (\_ _ i -> i + 1) 0 dmap
 instance Monoid (DMap t k v) where
   mempty = dEmpty
   mappend = dUnion
+
+data DMapIdentity
+type instance DMapFunction DMapIdentity a = a
+
+type DMapSimple = DMap DMapIdentity

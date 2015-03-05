@@ -8,22 +8,26 @@
 
 module Data.DependentMap (
 
-    DMap
-  , dEmpty
-  , dInsert
-  , dLookup
-  , dDelete
-  , dFoldWithKey
-  , dSize
+    DependentMap
 
-  , DMapFunction
+  , empty
+  , singleton
+  , insert
+  , alter
+  , lookup
+  , delete
+  , foldWithKey
+  , size
 
-  , DMapSimple
+  , DependentMapFunction
+
+  , DependentMapSimple
 
   , module Data.Typeable
 
   ) where
 
+import Prelude hiding (lookup)
 import Data.Typeable
 import Data.Monoid
 
@@ -52,81 +56,117 @@ heteroOrd x y = case eqT :: Maybe (a :~: b) of
   Just Refl -> x `compare` y
   Nothing ->  typeRep (Proxy :: Proxy a) `compare` typeRep (Proxy :: Proxy b)
 
-type family DMapFunction (t :: *) (a :: *) :: *
+type family DependentMapFunction (t :: *) (a :: *) :: *
 
 -- | A "dependent map" in which the type of keys has a variable parameter, and
 --   the type of the values depends upon the parameter of the particular key.
-data DMap :: * -> (* -> *) -> (* -> *) -> * where
-  DMapNil :: DMap t k v
-  DMapCons
+data DependentMap :: * -> (* -> *) -> (* -> *) -> * where
+  DependentMapNil :: DependentMap t k v
+  DependentMapCons
     :: ( Ord (k a)
        , Typeable a
        , Typeable b
-       , b ~ DMapFunction t a
+       , b ~ DependentMapFunction t a
        )
     => k a
     -> v b
-    -> DMap t k v
-    -> DMap t k v
+    -> DependentMap t k v
+    -> DependentMap t k v
 
-dEmpty :: DMap t k v
-dEmpty = DMapNil
+empty :: DependentMap t k v
+empty = DependentMapNil
 
-dInsert
+singleton
+  :: forall t k v a b .
+     ( Ord (k a)
+     , Typeable a
+     , Typeable b
+     , b ~ DependentMapFunction t a
+     )
+  => k a
+  -> v b
+  -> DependentMap t k v
+singleton key val = DependentMapCons key val empty
+
+insert
   :: ( Eq (k a)
      , Ord (k a)
      , Typeable a
      , Typeable b
-     , b ~ DMapFunction t a
+     , b ~ DependentMapFunction t a
      )
   => k a
   -> v b
-  -> DMap t k v
-  -> DMap t k v
-dInsert key val dmap = case dmap of
-  DMapNil -> DMapCons key val DMapNil
-  DMapCons key' val' rest -> case heteroEq key key' of
-    True -> DMapCons key val rest
-    False -> DMapCons key' val' (dInsert key val rest)
+  -> DependentMap t k v
+  -> DependentMap t k v
+insert key val dmap = case dmap of
+  DependentMapNil -> DependentMapCons key val DependentMapNil
+  DependentMapCons key' val' rest -> case heteroEq key key' of
+    True -> DependentMapCons key val rest
+    False -> DependentMapCons key' val' (insert key val rest)
 
-dLookup
+alter
+  :: forall t k v a b .
+     ( Ord (k a)
+     , Typeable a
+     , Typeable b
+     , b ~ DependentMapFunction t a
+     )
+  => (Maybe (v b) -> Maybe (v b))
+  -> k a
+  -> DependentMap t k v
+  -> DependentMap t k v
+alter f key dmap = case f (lookup key dmap) of
+  Just val -> insert key val dmap
+  Nothing -> delete key dmap
+{-
+alter f key dmap = case lookup key dmap of
+  Just val -> case f (Just val) of
+    Just val' -> insert key val' dmap
+    Nothing -> delete key dmap
+  Nothing -> case f Nothing of
+    Just val' -> insert key val' dmap
+    Nothing -> dmap
+-}
+
+lookup
   :: forall t k v a b c .
      ( Eq (k a)
      , Typeable a
      , Typeable b
-     , b ~ (DMapFunction t a)
+     , b ~ (DependentMapFunction t a)
      )
   => k a
   -- ^ Will look this up under heterogeneous equality...
-  -> DMap t k v
+  -> DependentMap t k v
   -- ^ ... in this heterogeneous map ...
   -> Maybe (v b)
   -- ^ ... and if a match is found, you get a value and an equality.
-dLookup key dmap = case dmap of
-  DMapNil -> Nothing
+lookup key dmap = case dmap of
+  DependentMapNil -> Nothing
   -- TODO encapsulate this as a "special eq" or perhaps "heterogeneous eq"
-  DMapCons key' (val :: v d) rest -> case eqT :: Maybe (d :~: (DMapFunction t a)) of
-    Just Refl -> if heteroEq key key' then Just val else dLookup key rest
+  DependentMapCons key' (val :: v d) rest -> case eqT :: Maybe (d :~: (DependentMapFunction t a)) of
+    Just Refl -> if heteroEq key key' then Just val else lookup key rest
     -- ^ Pattern matching on the Refl allows us to use the Match constructor.
-    Nothing -> dLookup key rest
+    Nothing -> lookup key rest
 
-dDelete
+delete
   :: ( Eq (k a)
      , Typeable a
      )
   => k a
-  -> DMap t k v
-  -> DMap t k v
-dDelete key dmap = case dmap of
-  DMapNil -> DMapNil
-  DMapCons key' _ rest -> if heteroEq key key' then rest else dDelete key dmap
+  -> DependentMap t k v
+  -> DependentMap t k v
+delete key dmap = case dmap of
+  DependentMapNil -> DependentMapNil
+  DependentMapCons key' _ rest -> if heteroEq key key' then rest else delete key dmap
 
 -- How could a fold possibly work?
 -- The provided function has to switch its behaviour based on the type
 -- parameter!
 -- This attempt is not very useful; all we can use is functions parametrically
 -- polymorphic in the parameter!
-dFoldWithKey
+foldWithKey
   :: forall t k v r .
      (
      )
@@ -134,7 +174,7 @@ dFoldWithKey
        ( Ord (k a)
        , Typeable a
        , Typeable b
-       , b ~ DMapFunction t a
+       , b ~ DependentMapFunction t a
        )
        => k a
        -> v b
@@ -142,36 +182,36 @@ dFoldWithKey
        -> r
      )
   -- ^ We're careful to throw everything we know about a and b into the context.
-  --   These constraints are just plucked from the DMapCons constructor.
+  --   These constraints are just plucked from the DependentMapCons constructor.
   -> r
-  -> DMap t k v
+  -> DependentMap t k v
   -> r
-dFoldWithKey f b dmap = case dmap of
-  DMapNil -> b
-  DMapCons key val rest -> dFoldWithKey f (f key val b) rest
+foldWithKey f b dmap = case dmap of
+  DependentMapNil -> b
+  DependentMapCons key val rest -> foldWithKey f (f key val b) rest
 
-dUnion
+union
   :: forall t k v .
      (
      )
-  => DMap t k v
-  -> DMap t k v
-  -> DMap t k v
-dUnion dmapLeft dmapRight = dFoldWithKey dInsert dmapLeft dmapRight
+  => DependentMap t k v
+  -> DependentMap t k v
+  -> DependentMap t k v
+union dmapLeft dmapRight = foldWithKey insert dmapLeft dmapRight
 
-dSize
+size
   :: forall t k v .
      (
      )
-  => DMap t k v
+  => DependentMap t k v
   -> Int
-dSize dmap = dFoldWithKey (\_ _ i -> i + 1) 0 dmap
+size dmap = foldWithKey (\_ _ i -> i + 1) 0 dmap
 
-instance Monoid (DMap t k v) where
-  mempty = dEmpty
-  mappend = dUnion
+instance Monoid (DependentMap t k v) where
+  mempty = empty
+  mappend = union
 
-data DMapIdentity
-type instance DMapFunction DMapIdentity a = a
+data DependentMapIdentity
+type instance DependentMapFunction DependentMapIdentity a = a
 
-type DMapSimple = DMap DMapIdentity
+type DependentMapSimple = DependentMap DependentMapIdentity

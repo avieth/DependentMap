@@ -4,6 +4,19 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE RankNTypes #-}
 
+module Data.DependentMap (
+
+    DMap
+  , dEmpty
+  , dInsert
+  , dLookup
+  , dDelete
+  , dFold
+  , dFoldWithKey
+  , module Data.Typeable
+
+  ) where
+
 import Data.Typeable
 
 heteroEq :: forall v a b . (Eq (v a), Typeable a, Typeable b) => v a -> v b -> Bool
@@ -29,6 +42,9 @@ data DMap :: (* -> *) -> (* -> *) -> * where
     -> v a
     -> DMap k v
     -> DMap k v
+
+dEmpty :: DMap k v
+dEmpty = DMapNil
 
 dInsert
   :: ( Eq (k a)

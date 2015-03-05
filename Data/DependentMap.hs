@@ -55,7 +55,11 @@ dInsert
   -> v a
   -> DMap k v
   -> DMap k v
-dInsert = DMapCons
+dInsert key val dmap = case dmap of
+  DMapNil -> DMapCons key val DMapNil
+  DMapCons key' val' rest -> case heteroEq key key' of
+    True -> DMapCons key val rest
+    False -> DMapCons key' val' (dInsert key val rest)
 
 dLookup
   :: forall k v a b .

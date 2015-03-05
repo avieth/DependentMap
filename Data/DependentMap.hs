@@ -57,8 +57,7 @@ type family DMapFunction (t :: *) (a :: *) :: *
 data DMap :: * -> (* -> *) -> (* -> *) -> * where
   DMapNil :: DMap t k v
   DMapCons
-    :: ( Eq (k a)
-       , Ord (k a)
+    :: ( Ord (k a)
        , Typeable a
        , Typeable b
        , b ~ DMapFunction t a
@@ -129,35 +128,25 @@ dFoldWithKey
   :: forall t k v r .
      (
      )
-  => (forall a . k a -> v (DMapFunction t a) -> r -> r)
+  => ( forall a b .
+       ( Ord (k a)
+       , Typeable a
+       , Typeable b
+       , b ~ DMapFunction t a
+       )
+       => k a
+       -> v b
+       -> r
+       -> r
+     )
+  -- ^ We're careful to throw everything we know about a and b into the context.
+  --   These constraints are just plucked from the DMapCons constructor.
   -> r
   -> DMap t k v
   -> r
 dFoldWithKey f b dmap = case dmap of
   DMapNil -> b
   DMapCons key val rest -> dFoldWithKey f (f key val b) rest
-
--- The problem: you just don't know what parameters could be used in the map!
--- Yet still the function you give must work on ANY parameter! We have this
--- problem even for the earlier version, without DMapFunction. If your k and
--- v types give enough information, then that's great. If not, then you're
--- out of luck.
-dFoldWithKey'
-  :: forall t k v r .
-     (
-     )
-  => (forall a . k a -> v (DMapFunction t a) -> r -> r)
-  -> r
-  -> DMap t k v
-  -> r
-dFoldWithKey' f b dmap = case dmap of
-  DMapNil -> b
-  DMapCons key val rest -> dFoldWithKey f (f key val b) rest
-
--- Another problem: we demand Typeable (DMapFunction t a) FOR EVERY a!!!!
--- Damn...
--- Hm, can't we just take it at insert time, then recover it from pattern
--- matching on DMapCons?
 
 dUnion
   :: forall t k v .
@@ -166,11 +155,7 @@ dUnion
   => DMap t k v
   -> DMap t k v
   -> DMap t k v
-dUnion dmapLeft dmapRight = case dmapRight of
-  DMapNil -> dmapLeft
-  DMapCons key val rest -> dInsert key val (dUnion dmapLeft rest)
--- Interesting: the above works, but the below does not!
---dUnion dmapLeft dmapRight = dFoldWithKey union dmapLeft dmapRight
+dUnion dmapLeft dmapRight = dFoldWithKey dInsert dmapLeft dmapRight
 
 dSize
   :: forall t k v .

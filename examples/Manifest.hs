@@ -9,7 +9,9 @@
 
 import qualified Data.DependentMap as DM
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as B8
 import qualified Data.Text as T
+import Data.String
 import Data.Functor.Identity
 import Data.Typeable
 import Data.Monoid
@@ -271,6 +273,33 @@ makeN pfi = case pfi of
   CPFI pfiA pfiB -> CPFN (makeN pfiA) (makeN pfiB)
   IPFI pfi' -> makeN (pfInvert pfi')
 
+function
+  :: ( ManifestRead m
+     , ResourceDescriptor (ManifestResourceDescriptor m)
+     , ManifestDomainConstraint m domain range
+     , ManifestRangeConstraint m domain range
+     , AccessConstraint m access
+     )
+  => m mtype access domain range
+  -> PartialFunction access domain range
+function = Normal . PFN
+
+injection
+  :: ( ManifestRead m
+     , ResourceDescriptor (ManifestResourceDescriptor m)
+     , ManifestDomainConstraint m domain range
+     , ManifestRangeConstraint m domain range
+     , ManifestDomainConstraint m range domain
+     , ManifestRangeConstraint m range domain
+     -- ^ We need the range and domain constraints on both sides, since we
+     --   may invert!
+     , AccessConstraint m access
+     , ManifestInjective m
+     )
+  => m MInjective access domain range
+  -> PartialFunction access domain range
+injection = Injective . PFI
+
 compose
   :: PartialFunction access1 domain range1
   -> PartialFunction access2 range1 range
@@ -400,9 +429,9 @@ at pf x = liftF (MAt pf x id)
 assign :: PartialFunction ReadWrite domain range -> domain -> Maybe range -> M ()
 assign pf x y = liftF (MAssign pf x y ())
 
-infixr 9 .:=
+infixr 1 .:=
 
-(.:=) = assign
+(.:=) (pf, x) y = assign pf x y
 
 runM :: M a -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO a
 runM term = iterM run term >>= finalize
@@ -429,8 +458,8 @@ runM term = iterM run term >>= finalize
 -- We should now be equipped to interpret the M monad from other examples,
 -- without assignment.
 
-data SQLiteManifest mtype access domain range where
-  SQLiteManifest :: SQLiteDescriptor -> String -> SQLiteManifest MNotInjective ReadOnly domain range
+data SQLiteManifest :: MType -> Access -> * -> * -> * where
+  SQLiteManifest :: SQLiteDescriptor -> BS.ByteString -> SQLiteManifest mtype access domain range
 
 class TextSerializable a where
   textSerialize :: a -> T.Text
@@ -452,26 +481,41 @@ instance Manifest SQLiteManifest where
 
 instance ManifestRead SQLiteManifest where
   mget (SQLiteManifest _ tableName) conn key = do
-    y <- query conn "SELECT \"2\" FROM test WHERE \"1\"=?" (Only key) :: IO [Only T.Text]
+    let queryString = fromString . B8.unpack $ BS.concat ["SELECT \"2\" FROM ", tableName, " WHERE \"1\"=?"]
+    -- ^ SQLite simple doesn't allow query substitution for table name and
+    --   where clause simultaneously :(
+    y <- query conn queryString (Only key) :: IO [Only T.Text]
     return $ case y of
       [] -> Nothing
       (y' : _) -> Just (fromOnly y')
 
+instance ManifestWrite SQLiteManifest where
+  mrangeDump _ = textSerialize
+  mset (SQLiteManifest _ tableName) conn key value = case value of
+    Nothing -> do
+        let queryString = fromString . B8.unpack $ BS.concat ["DELETE FROM ", tableName, " WHERE \"1\"=?"]
+        execute conn queryString (Only key)
+    Just value -> do
+        let list = ["INSERT OR REPLACE INTO ", tableName, " VALUES (?, ?)"]
+        let queryString = fromString . B8.unpack . BS.concat $ list
+        execute conn queryString (key, value)
+
 pm :: PureManifest MNotInjective ReadOnly Bool String
 pm = PureManifest (\x -> Just $ if x then "foo" else "bar")
 
-sq :: SQLiteManifest MNotInjective ReadOnly String String
+sq :: SQLiteManifest MNotInjective ReadWrite String String
 sq = SQLiteManifest (SQLD "./test1.db") "test"
 
-pf1 = Normal $ PFN pm
+pf1 = function pm
 
-pf2 = Normal $ PFN sq
+pf2 = function sq
 
 exampleTerm1 :: M (Maybe String)
 exampleTerm1 = do
   foo <- pf1 `at` True
   bar <- pf2 `at` "foo"
+  (pf2, "foo") .:= ((++) "!") <$> bar
   return $ (++) <$> foo <*> bar
 
 exampleTerm2 :: M (Maybe String)
-exampleTerm2 = (pf1 ~> pf2) `at` False
+exampleTerm2 = (pf1 ~> pf2) `at` True

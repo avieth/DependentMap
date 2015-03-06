@@ -84,12 +84,12 @@ release (Resource r rel) = rel r
 --   We demand Ord because we want the descriptor to uniquely determine a
 --   resource and to be able to use descriptors in efficient maps. Two
 --   descriptors must be equal if and only if the resources they would
---   produce (via makeResource) would be observationally identical!
+--   produce (via acquireResource) would be observationally identical!
 --   The ordering is irrelevant, so long as it's really a total order.
 --   Typeable is needed so that we can use it in a dependent map.
 class (Ord rd, Typeable rd) => ResourceDescriptor rd where
   type ResourceType rd :: *
-  makeResource :: rd -> IO (Resource (ResourceType rd))
+  acquireResource :: rd -> IO (Resource (ResourceType rd))
 
 -- TODO proper Eq instance demands that we not use string equality, but
 -- file path equality, so that two FileDercriptors are equal precisely
@@ -99,7 +99,7 @@ data FileDescriptor = FD FilePath
 
 instance ResourceDescriptor FileDescriptor where
   type ResourceType FileDescriptor = Handle
-  makeResource (FD fp) = do
+  acquireResource (FD fp) = do
     h <- openFile fp ReadMode
     return $ Resource h hClose
 
@@ -108,14 +108,14 @@ data PureDescriptor = PD
 
 instance ResourceDescriptor PureDescriptor where
   type ResourceType PureDescriptor = ()
-  makeResource PD = return $ Resource () return
+  acquireResource PD = return $ Resource () return
 
 data SQLiteDescriptor = SQLD String
   deriving (Eq, Ord, Typeable)
 
 instance ResourceDescriptor SQLiteDescriptor where
   type ResourceType SQLiteDescriptor = Connection
-  makeResource (SQLD str) = do
+  acquireResource (SQLD str) = do
     conn <- open str
     return $ Resource conn close
 
@@ -130,10 +130,10 @@ exampleRM = do
   let fd2 = FD "./test2.txt"
   let sql1 = SQLD "./test1.db"
   let sql2 = SQLD "./test2.db"
-  r1 <- makeResource fd1
-  r2 <- makeResource fd2
-  r3 <- makeResource sql1
-  r4 <- makeResource sql2
+  r1 <- acquireResource fd1
+  r2 <- acquireResource fd2
+  r3 <- acquireResource sql1
+  r4 <- acquireResource sql2
   return $
          DM.singleton (Identity fd1) r1
       <> DM.singleton (Identity fd2) r2
@@ -333,7 +333,7 @@ runGet manifest x = do
     dmap <- get
     rsrc <- case DM.lookup (Identity $ resourceDescriptor manifest) dmap of
       Nothing -> do
-          r <- liftIO $ makeResource (resourceDescriptor manifest)
+          r <- liftIO $ acquireResource (resourceDescriptor manifest)
           put $ DM.insert (Identity $ resourceDescriptor manifest) r dmap
           return r
       Just r -> return r
@@ -356,7 +356,7 @@ runSet manifest x y = do
     dmap <- get
     rsrc <- case DM.lookup (Identity $ resourceDescriptor manifest) dmap of
       Nothing -> do
-          r <- liftIO $ makeResource (resourceDescriptor manifest)
+          r <- liftIO $ acquireResource (resourceDescriptor manifest)
           put $ DM.insert (Identity $ resourceDescriptor manifest) r dmap
           return r
       Just r -> return r

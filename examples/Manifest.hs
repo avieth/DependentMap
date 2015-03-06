@@ -469,6 +469,15 @@ instance TextSerializable [Char] where
   textSerialize = T.pack
   textDeserialize = Just . T.unpack
 
+instance TextSerializable Bool where
+  textSerialize b = case b of
+    True -> "True"
+    False -> "False"
+  textDeserialize text = case T.unpack text of
+    "True" -> Just True
+    "False" -> Just False
+    _ -> Nothing
+
 instance Manifest SQLiteManifest where
   type ManifestResourceDescriptor SQLiteManifest = SQLiteDescriptor
   resourceDescriptor (SQLiteManifest sqld _) = sqld
@@ -503,12 +512,17 @@ instance ManifestWrite SQLiteManifest where
 pm :: PureManifest MNotInjective ReadOnly Bool String
 pm = PureManifest (\x -> Just $ if x then "foo" else "bar")
 
-sq :: SQLiteManifest MNotInjective ReadWrite String String
-sq = SQLiteManifest (SQLD "./test1.db") "test"
+sq1 :: SQLiteManifest MNotInjective ReadWrite String String
+sq1 = SQLiteManifest (SQLD "./test1.db") "test"
+
+sq2 :: SQLiteManifest MNotInjective ReadWrite String Bool
+sq2 = SQLiteManifest (SQLD "./test2.db") "test"
 
 pf1 = function pm
 
-pf2 = function sq
+pf2 = function sq1
+
+pf3 = function sq2
 
 exampleTerm1 :: M (Maybe String)
 exampleTerm1 = do
@@ -519,3 +533,8 @@ exampleTerm1 = do
 
 exampleTerm2 :: M (Maybe String)
 exampleTerm2 = (pf1 ~> pf2) `at` True
+
+exampleTerm3 = do
+  (pf2, "userA") .:= Just "user@name.com"
+  (pf3, "user@name.com") .:= Just False
+  (pf2 ~> pf3) `at` "userA"

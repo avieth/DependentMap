@@ -3,8 +3,9 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 import qualified Data.DependentMap as DM
 import qualified Data.ByteString as BS
@@ -143,26 +144,64 @@ releaseAll dmap = DM.foldWithKey releaseOne (return ()) dmap
   where
     releaseOne _ res io = io >> release res
 
-class Manifest a where
+-- DEFINITION OF MANIFEST CLASSES
+
+data Access = ReadOnly | ReadWrite
+data MType = MInjective | MNotInjective
+
+class Manifest (a :: MType -> Access -> * -> * -> *) where
   type ManifestResourceDescriptor a :: *
-  resourceDescriptor :: a domain range -> ManifestResourceDescriptor a
+  resourceDescriptor :: a mtype access domain range -> ManifestResourceDescriptor a
   -- The actual "low-level" domain and range types can depend upon
   -- the "high-level" domain and range.
   type ManifestDomainType a domain range :: *
   type ManifestRangeType a domain range :: *
   type ManifestDomainConstraint a domain range :: Constraint
   type ManifestRangeConstraint a domain range :: Constraint
-  mdomainDump :: ManifestDomainConstraint a domain range => a domain range -> domain -> ManifestDomainType a domain range
-  mrangePull :: ManifestRangeConstraint a domain range => a domain range -> ManifestRangeType a domain range -> Maybe range
+  mdomainDump
+    :: ManifestDomainConstraint a domain range
+    => a mtype access domain range
+    -> domain
+    -> ManifestDomainType a domain range
+  mrangePull
+    :: ManifestRangeConstraint a domain range
+    => a mtype access domain range
+    -> ManifestRangeType a domain range
+    -> Maybe range
+
+class Manifest a => ManifestRead a where
   mget
     :: (
        )
-    => a domain range
+    => a mtype access domain range
     -> ResourceType (ManifestResourceDescriptor a)
     -> ManifestDomainType a domain range
     -> IO (Maybe (ManifestRangeType a domain range))
 
-data PureManifest a b = PureManifest (a -> Maybe b)
+class Manifest a => ManifestWrite a where
+  mrangeDump
+    :: ManifestRangeConstraint a domain range
+    => a mtype access domain range
+    -> range
+    -> ManifestRangeType a domain range
+  mset
+    :: (
+       )
+    => a mtype ReadWrite domain range
+    -> ResourceType (ManifestResourceDescriptor a)
+    -> ManifestDomainType a domain range
+    -> Maybe (ManifestRangeType a domain range)
+    -> IO ()
+
+class Manifest a => ManifestInjective a where
+  minvert 
+    :: ( mtype ~ MInjective
+       )
+    => a mtype access domain range
+    -> a mtype access range domain
+
+data PureManifest mtype access a b where
+  PureManifest :: (a -> Maybe b) -> PureManifest MNotInjective ReadOnly a b
 
 instance Manifest PureManifest where
   type ManifestResourceDescriptor PureManifest = PureDescriptor
@@ -173,35 +212,71 @@ instance Manifest PureManifest where
   type ManifestRangeConstraint PureManifest domain range = ()
   mdomainDump = const id
   mrangePull = const Just
+
+instance ManifestRead PureManifest where
   mget (PureManifest f) () x = return $ f x
 
 data M' t where
   MPure :: t -> M' t
   MAt
-    :: ( Manifest m
+    :: ( ManifestRead m
        , ResourceDescriptor (ManifestResourceDescriptor m)
        , ManifestDomainConstraint m domain range
        , ManifestRangeConstraint m domain range
        )
-    => m domain range -> domain -> (Maybe range -> t) -> M' t
+    => m mtype access domain range -> domain -> (Maybe range -> t) -> M' t
+  MAssign
+    :: ( ManifestWrite m
+       , ResourceDescriptor (ManifestResourceDescriptor m)
+       , ManifestDomainConstraint m domain range
+       , ManifestRangeConstraint m domain range
+       )
+    => m mtype ReadWrite domain range -> domain -> Maybe range -> t -> M' t
 
 instance Functor M' where
   fmap f m' = case m' of
     MPure x -> MPure $ f x
     MAt manifest x g -> MAt manifest x (fmap f g)
+    MAssign manifest x y next -> MAssign manifest x y (f next)
 
 type M = Free M'
 
 at
-  :: ( Manifest m
+  :: ( ManifestRead m
      , ResourceDescriptor (ManifestResourceDescriptor m)
      , ManifestDomainConstraint m domain range
      , ManifestRangeConstraint m domain range
      )
-  => m domain range
+  => m mtype access domain range
   -> domain
   -> M (Maybe range)
 at m d = liftF (MAt m d id)
+
+assign
+  :: ( ManifestWrite m
+     , ResourceDescriptor (ManifestResourceDescriptor m)
+     , ManifestDomainConstraint m domain range
+     , ManifestRangeConstraint m domain range
+     )
+  => m mtype ReadWrite domain range
+  -> domain
+  -> Maybe range
+  -> M ()
+assign m x y = liftF (MAssign m x y ())
+
+infixr 9 .:=
+
+(.:=)
+  :: ( ManifestWrite m
+     , ResourceDescriptor (ManifestResourceDescriptor m)
+     , ManifestDomainConstraint m domain range
+     , ManifestRangeConstraint m domain range
+     )
+  => m mtype ReadWrite domain range
+  -> domain
+  -> Maybe range
+  -> M ()
+(.:=) = assign
 
 runM :: M a -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO a
 runM term = iterM run term >>= finalize
@@ -228,6 +303,17 @@ runM term = iterM run term >>= finalize
         case y of
           Nothing -> next Nothing
           Just y' -> next (mrangePull manifest y')
+      MAssign manifest x y next -> do
+        dmap <- get
+        rsrc <- case DM.lookup (Identity $ resourceDescriptor manifest) dmap of
+          Nothing -> do
+              r <- liftIO $ makeResource (resourceDescriptor manifest)
+              put $ DM.insert (Identity $ resourceDescriptor manifest) r dmap
+              return r
+          Just r -> return r
+        let y' = mrangeDump manifest <$> y
+        liftIO $ mset manifest (resource rsrc) (mdomainDump manifest x) y'
+        next
 
 -- Moving forward: we need a custom monad which is
 --   IO
@@ -238,7 +324,8 @@ runM term = iterM run term >>= finalize
 -- We should now be equipped to interpret the M monad from other examples,
 -- without assignment.
 
-data SQLiteManifest domain range = SQLiteManifest SQLiteDescriptor String
+data SQLiteManifest mtype access domain range where
+  SQLiteManifest :: SQLiteDescriptor -> String -> SQLiteManifest MNotInjective ReadOnly domain range
 
 class TextSerializable a where
   textSerialize :: a -> T.Text
@@ -257,17 +344,22 @@ instance Manifest SQLiteManifest where
   type ManifestRangeConstraint SQLiteManifest domain range = TextSerializable range
   mdomainDump _ = textSerialize
   mrangePull _ = textDeserialize
+
+instance ManifestRead SQLiteManifest where
   mget (SQLiteManifest _ tableName) conn key = do
     y <- query conn "SELECT \"2\" FROM test WHERE 1=1 OR \"1\"=?" (Only key) :: IO [Only T.Text]
     return $ case y of
       [] -> Nothing
       (y' : _) -> Just (fromOnly y')
 
+pm :: PureManifest MNotInjective ReadOnly Bool String
+pm = PureManifest (\x -> Just $ show x)
 
+sq :: SQLiteManifest MNotInjective ReadOnly String String
+sq = SQLiteManifest (SQLD "./test1.db") "test"
 
 exampleTerm :: M (Maybe String)
 exampleTerm = do
-  foo <- (PureManifest (\x -> Just $ show x) :: PureManifest Bool String) `at` True
-  bar <- (SQLiteManifest (SQLD "./test1.db") "test" :: SQLiteManifest String String) `at` "foo"
+  foo <- pm `at` True
+  bar <- sq `at` "foo"
   return $ (++) <$> foo <*> bar
-

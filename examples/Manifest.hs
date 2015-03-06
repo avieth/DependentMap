@@ -68,16 +68,31 @@ exampleDM =
   <> DM.singleton (Identity $ ThingTwo "c") (Left WTF)
   <> DM.empty
 
+type RollbackEffect r = r -> IO ()
+type CommitEffect r = r -> IO ()
+type ReleaseEffect r = r -> IO ()
 
+-- | TBD Should we demand commit and rollback for every resource? Some
+--   resources are read-only, in which case we wouldn't need these, no?
 data Resource r where
-  Resource :: r -> (r -> IO ()) -> Resource r
-  -- ^ The resource, and an action to release it (must never fail).
+  Resource
+    :: r
+    -> CommitEffect r
+    -> RollbackEffect r
+    -> ReleaseEffect r
+    -> Resource r
 
 resource :: Resource r -> r
-resource (Resource r _) = r
+resource (Resource r _ _ _) = r
+
+commit :: Resource r -> IO ()
+commit (Resource r c _ _) = c r
+
+rollback :: Resource r -> IO ()
+rollback (Resource r _ rb _) = rb r
 
 release :: Resource r -> IO ()
-release (Resource r rel) = rel r
+release (Resource r _ _ rel) = rel r
 
 -- | A ResourceDescriptor determines a kind of resource, and describes how
 --   to produce one.
@@ -91,24 +106,16 @@ class (Ord rd, Typeable rd) => ResourceDescriptor rd where
   type ResourceType rd :: *
   acquireResource :: rd -> IO (Resource (ResourceType rd))
 
--- TODO proper Eq instance demands that we not use string equality, but
--- file path equality, so that two FileDercriptors are equal precisely
--- when their FilePaths pick out the same resource.
-data FileDescriptor = FD FilePath
-  deriving (Eq, Ord, Typeable)
-
-instance ResourceDescriptor FileDescriptor where
-  type ResourceType FileDescriptor = Handle
-  acquireResource (FD fp) = do
-    h <- openFile fp ReadMode
-    return $ Resource h hClose
-
 data PureDescriptor = PD
   deriving (Eq, Ord, Typeable)
 
 instance ResourceDescriptor PureDescriptor where
   type ResourceType PureDescriptor = ()
-  acquireResource PD = return $ Resource () return
+  acquireResource PD = return $ Resource () commit rollback release
+    where
+      commit _ = return ()
+      rollback _ = return ()
+      release _ = return ()
 
 data SQLiteDescriptor = SQLD String
   deriving (Eq, Ord, Typeable)
@@ -116,30 +123,26 @@ data SQLiteDescriptor = SQLD String
 instance ResourceDescriptor SQLiteDescriptor where
   type ResourceType SQLiteDescriptor = Connection
   acquireResource (SQLD str) = do
-    conn <- open str
-    return $ Resource conn close
+      putStrLn $ "acquiring SQLite db " ++ str
+      conn <- open str
+      execute_ conn "BEGIN TRANSACTION"
+      return $ Resource conn commit rollback release
+    where
+      rollback conn = do
+        putStrLn $ "rolling back SQLite transaction " ++ str
+        execute_ conn "ROLLBACK TRANSACTION"
+      commit conn = do
+        putStrLn $ "committing SQLite transaction " ++ str
+        execute_ conn "COMMIT TRANSACTION"
+      release conn = do
+        putStrLn $ "releaseing SQLite db " ++ str
+        close conn
+
 
 type DResourceKey = Identity
 
 data DResourceMap
 type instance DM.DependentMapFunction DResourceMap a = ResourceType a
-
-exampleRM :: IO (DM.DependentMap DResourceMap DResourceKey Resource)
-exampleRM = do
-  let fd1 = FD "./test1.txt"
-  let fd2 = FD "./test2.txt"
-  let sql1 = SQLD "./test1.db"
-  let sql2 = SQLD "./test2.db"
-  r1 <- acquireResource fd1
-  r2 <- acquireResource fd2
-  r3 <- acquireResource sql1
-  r4 <- acquireResource sql2
-  return $
-         DM.singleton (Identity fd1) r1
-      <> DM.singleton (Identity fd2) r2
-      <> DM.singleton (Identity sql1) r3
-      <> DM.singleton (Identity sql2) r4
-      <> DM.empty
 
 releaseAll :: DM.DependentMap DResourceMap DResourceKey Resource -> IO ()
 releaseAll dmap = DM.foldWithKey releaseOne (return ()) dmap
@@ -150,6 +153,12 @@ releaseAll dmap = DM.foldWithKey releaseOne (return ()) dmap
 
 data Access = ReadOnly | ReadWrite
 data MType = MInjective | MNotInjective
+
+type family MTypeMeet (m1 :: MType) (m2 :: MType) :: MType where
+  MTypeMeet MInjective MInjective = MInjective
+  MTypeMeet MNotInjective MInjective = MNotInjective
+  MTypeMeet MInjective MNotInjective = MNotInjective
+  MTypeMeet MNotInjective MNotInjective = MNotInjective
 
 type family AccessConstraint m (a :: Access) :: Constraint where
   AccessConstraint m ReadOnly = ()
@@ -207,7 +216,14 @@ class Manifest a => ManifestInjective a where
     -> a mtype access range domain
 
 data PureManifest mtype access a b where
-  PureManifest :: (a -> Maybe b) -> PureManifest MNotInjective ReadOnly a b
+  PureManifestN :: (a -> Maybe b) -> PureManifest MNotInjective ReadOnly a b
+  PureManifestI :: (a -> Maybe b) -> (b -> Maybe a) -> PureManifest MInjective ReadOnly a b
+
+pureFunction :: (a -> Maybe b) -> PureManifest MNotInjective ReadOnly a b
+pureFunction = PureManifestN
+
+pureInjection :: (a -> Maybe b) -> (b -> Maybe a) -> PureManifest MInjective ReadOnly a b
+pureInjection = PureManifestI
 
 instance Manifest PureManifest where
   type ManifestResourceDescriptor PureManifest = PureDescriptor
@@ -220,8 +236,13 @@ instance Manifest PureManifest where
   mrangePull = const Just
 
 instance ManifestRead PureManifest where
-  mget (PureManifest f) () x = return $ f x
+  mget pm () x = case pm of
+    PureManifestN f -> return $ f x
+    PureManifestI f _ -> return $ f x
 
+instance ManifestInjective PureManifest where
+  minvert pm = case pm of
+    PureManifestI f g -> PureManifestI g f
 
 data PartialFunctionN :: Access -> * -> * -> * where
   PFN
@@ -263,9 +284,9 @@ data PartialFunctionI :: Access -> * -> * -> * where
     :: PartialFunctionI access domain range
     -> PartialFunctionI access range domain
 
-data PartialFunction :: Access -> * -> * -> * where
-  Normal :: PartialFunctionN access a b -> PartialFunction access a b
-  Injective :: PartialFunctionI access a b -> PartialFunction access a b
+data PartialFunction :: MType -> Access -> * -> * -> * where
+  Normal :: PartialFunctionN access a b -> PartialFunction MNotInjective access a b
+  Injective :: PartialFunctionI access a b -> PartialFunction MInjective access a b
 
 makeN :: PartialFunctionI access domain range -> PartialFunctionN access domain range
 makeN pfi = case pfi of
@@ -281,7 +302,7 @@ function
      , AccessConstraint m access
      )
   => m mtype access domain range
-  -> PartialFunction access domain range
+  -> PartialFunction MNotInjective access domain range
 function = Normal . PFN
 
 injection
@@ -297,13 +318,13 @@ injection
      , ManifestInjective m
      )
   => m MInjective access domain range
-  -> PartialFunction access domain range
+  -> PartialFunction MInjective access domain range
 injection = Injective . PFI
 
 compose
-  :: PartialFunction access1 domain range1
-  -> PartialFunction access2 range1 range
-  -> PartialFunction ReadOnly domain range
+  :: PartialFunction mtype1 access1 domain range1
+  -> PartialFunction mtype2 access2 range1 range
+  -> PartialFunction (MTypeMeet mtype1 mtype2) ReadOnly domain range
 compose pfA pfB = case pfA of
   Normal pfnA -> case pfB of
     Normal pfnB -> Normal $ CPFN pfnA pfnB
@@ -313,6 +334,12 @@ compose pfA pfB = case pfA of
     Injective pfiB -> Injective $ CPFI pfiA pfiB
 
 (~>) = compose
+
+invert
+  :: PartialFunction MInjective access domain range
+  -> PartialFunction MInjective access range domain
+invert pf = case pf of
+  Injective pfi -> Injective $ pfInvert pfi
 
 pfInvert :: PartialFunctionI access domain range -> PartialFunctionI access range domain
 pfInvert pf = case pf of
@@ -366,7 +393,7 @@ runSet manifest x y = do
 runPFGet
   :: (
      )
-  => PartialFunction access domain range
+  => PartialFunction mtype access domain range
   -> domain
   -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO (Maybe range)
 runPFGet pf x = case pf of
@@ -387,7 +414,7 @@ runPFGet pf x = case pf of
 runPFSet
   :: (
      )
-  => PartialFunction ReadWrite domain range
+  => PartialFunction mtype ReadWrite domain range
   -> domain
   -> Maybe range
   -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO ()
@@ -402,14 +429,14 @@ data M' t where
   MAt
     :: (
        )
-    => PartialFunction access domain range
+    => PartialFunction mtype access domain range
     -> domain
     -> (Maybe range -> t)
     -> M' t
   MAssign
     :: (
        )
-    => PartialFunction ReadWrite domain range
+    => PartialFunction mtype ReadWrite domain range
     -> domain
     -> Maybe range
     -> t
@@ -423,10 +450,17 @@ instance Functor M' where
 
 type M = Free M'
 
-at :: PartialFunction access domain range -> domain -> M (Maybe range)
+at :: PartialFunction mtype access domain range -> domain -> M (Maybe range)
 at pf x = liftF (MAt pf x id)
 
-assign :: PartialFunction ReadWrite domain range -> domain -> Maybe range -> M ()
+-- | Convenient for feeding results of `at`s to other `at`s; no need to
+--   pattern match on the Maybe; we do it for you.
+at_ :: PartialFunction mtype access domain range -> Maybe domain -> M (Maybe range)
+at_ pf x = case x of
+  Just x' -> at pf x'
+  Nothing -> return Nothing
+
+assign :: PartialFunction mtype ReadWrite domain range -> domain -> Maybe range -> M ()
 assign pf x y = liftF (MAssign pf x y ())
 
 infixr 1 .:=
@@ -509,8 +543,11 @@ instance ManifestWrite SQLiteManifest where
         let queryString = fromString . B8.unpack . BS.concat $ list
         execute conn queryString (key, value)
 
-pm :: PureManifest MNotInjective ReadOnly Bool String
-pm = PureManifest (\x -> Just $ if x then "foo" else "bar")
+pm1 :: PureManifest MNotInjective ReadOnly Bool String
+pm1 = pureFunction (\x -> Just $ if x then "foo" else "bar")
+
+pm2 :: PureManifest MInjective ReadOnly Int Int
+pm2 = pureInjection (\x -> Just $ x + 1) (\x -> Just $ x - 1)
 
 sq1 :: SQLiteManifest MNotInjective ReadWrite String String
 sq1 = SQLiteManifest (SQLD "./test1.db") "test"
@@ -518,7 +555,9 @@ sq1 = SQLiteManifest (SQLD "./test1.db") "test"
 sq2 :: SQLiteManifest MNotInjective ReadWrite String Bool
 sq2 = SQLiteManifest (SQLD "./test2.db") "test"
 
-pf1 = function pm
+pf1 = function pm1
+
+pf0 = injection pm2
 
 pf2 = function sq1
 
@@ -538,3 +577,8 @@ exampleTerm3 = do
   (pf2, "userA") .:= Just "user@name.com"
   (pf3, "user@name.com") .:= Just False
   (pf2 ~> pf3) `at` "userA"
+
+exampleTerm4 point = do
+  x <- pf0 `at` point
+  y <- (invert pf0) `at_` x
+  return $ (== point) <$> y

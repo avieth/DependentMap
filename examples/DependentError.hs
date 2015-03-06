@@ -149,6 +149,10 @@ releaseAll dmap = DM.foldWithKey releaseOne (return ()) dmap
 data Access = ReadOnly | ReadWrite
 data MType = MInjective | MNotInjective
 
+type family AccessConstraint m (a :: Access) :: Constraint where
+  AccessConstraint m ReadOnly = ()
+  AccessConstraint m ReadWrite = ManifestWrite m
+
 class Manifest (a :: MType -> Access -> * -> * -> *) where
   type ManifestResourceDescriptor a :: *
   resourceDescriptor :: a mtype access domain range -> ManifestResourceDescriptor a
@@ -216,22 +220,171 @@ instance Manifest PureManifest where
 instance ManifestRead PureManifest where
   mget (PureManifest f) () x = return $ f x
 
-data M' t where
-  MPure :: t -> M' t
-  MAt
+
+data PartialFunctionN :: Access -> * -> * -> * where
+  PFN
     :: ( ManifestRead m
        , ResourceDescriptor (ManifestResourceDescriptor m)
        , ManifestDomainConstraint m domain range
        , ManifestRangeConstraint m domain range
+       , AccessConstraint m access
        )
-    => m mtype access domain range -> domain -> (Maybe range -> t) -> M' t
-  MAssign
-    :: ( ManifestWrite m
+    => m mtype access domain range
+    -> PartialFunctionN access domain range
+  CPFN
+    :: PartialFunctionN access1 domain range1
+    -> PartialFunctionN access2 range1 range
+    -> PartialFunctionN ReadOnly domain range
+    -- ^ Always ReadOnly; you can only update an individual manifest, not
+    --   a composition.
+
+data PartialFunctionI :: Access -> * -> * -> * where
+  PFI
+    :: ( ManifestRead m
        , ResourceDescriptor (ManifestResourceDescriptor m)
        , ManifestDomainConstraint m domain range
        , ManifestRangeConstraint m domain range
+       , ManifestDomainConstraint m range domain
+       , ManifestRangeConstraint m range domain
+       -- ^ We need the range and domain constraints on both sides, since we
+       --   may invert!
+       , AccessConstraint m access
+       , ManifestInjective m
        )
-    => m mtype ReadWrite domain range -> domain -> Maybe range -> t -> M' t
+    => m MInjective access domain range
+    -> PartialFunctionI access domain range
+  CPFI
+    :: PartialFunctionI access1 domain range1
+    -> PartialFunctionI access2 range1 range
+    -> PartialFunctionI ReadOnly domain range
+  IPFI
+    :: PartialFunctionI access domain range
+    -> PartialFunctionI access range domain
+
+data PartialFunction :: Access -> * -> * -> * where
+  Normal :: PartialFunctionN access a b -> PartialFunction access a b
+  Injective :: PartialFunctionI access a b -> PartialFunction access a b
+
+makeN :: PartialFunctionI access domain range -> PartialFunctionN access domain range
+makeN pfi = case pfi of
+  PFI manifest -> PFN manifest
+  CPFI pfiA pfiB -> CPFN (makeN pfiA) (makeN pfiB)
+  IPFI pfi' -> makeN (pfInvert pfi')
+
+compose
+  :: PartialFunction access1 domain range1
+  -> PartialFunction access2 range1 range
+  -> PartialFunction ReadOnly domain range
+compose pfA pfB = case pfA of
+  Normal pfnA -> case pfB of
+    Normal pfnB -> Normal $ CPFN pfnA pfnB
+    Injective pfiB -> Normal $ CPFN pfnA (makeN pfiB)
+  Injective pfiA -> case pfB of
+    Normal pfnB -> Normal $ CPFN (makeN pfiA) pfnB
+    Injective pfiB -> Injective $ CPFI pfiA pfiB
+
+(~>) = compose
+
+pfInvert :: PartialFunctionI access domain range -> PartialFunctionI access range domain
+pfInvert pf = case pf of
+  PFI manifest -> PFI $ minvert manifest
+  CPFI pfA pfB -> CPFI (pfInvert pfB) (pfInvert pfA)
+  IPFI pf' -> pf'
+
+runGet
+  :: ( ManifestRead manifest
+     , ResourceDescriptor (ManifestResourceDescriptor manifest)
+     , ManifestDomainConstraint manifest domain range
+     , ManifestRangeConstraint manifest domain range
+     )
+  => manifest mtype access domain range
+  -> domain
+  -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO (Maybe range)
+runGet manifest x = do
+    dmap <- get
+    rsrc <- case DM.lookup (Identity $ resourceDescriptor manifest) dmap of
+      Nothing -> do
+          r <- liftIO $ makeResource (resourceDescriptor manifest)
+          put $ DM.insert (Identity $ resourceDescriptor manifest) r dmap
+          return r
+      Just r -> return r
+    y <- liftIO $ mget manifest (resource rsrc) (mdomainDump manifest x)
+    return $ case y of
+      Nothing -> Nothing
+      Just y' -> mrangePull manifest y'
+
+runSet
+  :: ( ManifestWrite manifest
+     , ResourceDescriptor (ManifestResourceDescriptor manifest)
+     , ManifestDomainConstraint manifest domain range
+     , ManifestRangeConstraint manifest domain range
+     )
+  => manifest mtype ReadWrite domain range
+  -> domain
+  -> Maybe range
+  -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO ()
+runSet manifest x y = do
+    dmap <- get
+    rsrc <- case DM.lookup (Identity $ resourceDescriptor manifest) dmap of
+      Nothing -> do
+          r <- liftIO $ makeResource (resourceDescriptor manifest)
+          put $ DM.insert (Identity $ resourceDescriptor manifest) r dmap
+          return r
+      Just r -> return r
+    let y' = mrangeDump manifest <$> y
+    liftIO $ mset manifest (resource rsrc) (mdomainDump manifest x) y'
+
+runPFGet
+  :: (
+     )
+  => PartialFunction access domain range
+  -> domain
+  -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO (Maybe range)
+runPFGet pf x = case pf of
+  Normal (PFN manifest) -> runGet manifest x
+  Injective (PFI manifest) -> runGet manifest x
+  Normal (CPFN pfA pfB) -> do
+    y <- runPFGet (Normal pfA) x
+    case y of
+      Nothing -> return Nothing
+      Just y' -> runPFGet (Normal pfB) y'
+  Injective (CPFI pfA pfB) -> do
+    y <- runPFGet (Injective pfA) x
+    case y of
+      Nothing -> return Nothing
+      Just y' -> runPFGet (Injective pfB) y'
+  Injective (IPFI pfA) -> runPFGet (Injective $ pfInvert pfA) x
+
+runPFSet
+  :: (
+     )
+  => PartialFunction ReadWrite domain range
+  -> domain
+  -> Maybe range
+  -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO ()
+runPFSet pf x y = case pf of
+  Normal (PFN manifest) -> runSet manifest x y
+  Injective (PFI manifest) -> runSet manifest x y
+  Injective (IPFI pf') -> runPFSet (Injective $ pfInvert pf') x y
+  -- Other cases ruled out by Access type.
+
+data M' t where
+  MPure :: t -> M' t
+  MAt
+    :: (
+       )
+    => PartialFunction access domain range
+    -> domain
+    -> (Maybe range -> t)
+    -> M' t
+  MAssign
+    :: (
+       )
+    => PartialFunction ReadWrite domain range
+    -> domain
+    -> Maybe range
+    -> t
+    -> M' t
 
 instance Functor M' where
   fmap f m' = case m' of
@@ -241,41 +394,14 @@ instance Functor M' where
 
 type M = Free M'
 
-at
-  :: ( ManifestRead m
-     , ResourceDescriptor (ManifestResourceDescriptor m)
-     , ManifestDomainConstraint m domain range
-     , ManifestRangeConstraint m domain range
-     )
-  => m mtype access domain range
-  -> domain
-  -> M (Maybe range)
-at m d = liftF (MAt m d id)
+at :: PartialFunction access domain range -> domain -> M (Maybe range)
+at pf x = liftF (MAt pf x id)
 
-assign
-  :: ( ManifestWrite m
-     , ResourceDescriptor (ManifestResourceDescriptor m)
-     , ManifestDomainConstraint m domain range
-     , ManifestRangeConstraint m domain range
-     )
-  => m mtype ReadWrite domain range
-  -> domain
-  -> Maybe range
-  -> M ()
-assign m x y = liftF (MAssign m x y ())
+assign :: PartialFunction ReadWrite domain range -> domain -> Maybe range -> M ()
+assign pf x y = liftF (MAssign pf x y ())
 
 infixr 9 .:=
 
-(.:=)
-  :: ( ManifestWrite m
-     , ResourceDescriptor (ManifestResourceDescriptor m)
-     , ManifestDomainConstraint m domain range
-     , ManifestRangeConstraint m domain range
-     )
-  => m mtype ReadWrite domain range
-  -> domain
-  -> Maybe range
-  -> M ()
 (.:=) = assign
 
 runM :: M a -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO a
@@ -290,30 +416,9 @@ runM term = iterM run term >>= finalize
     run :: M' (StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO a)
         -> StateT (DM.DependentMap DResourceMap DResourceKey Resource) IO a
     run m' = case m' of
-      MPure io -> io
-      MAt manifest x next -> do
-        dmap <- get
-        rsrc <- case DM.lookup (Identity $ resourceDescriptor manifest) dmap of
-          Nothing -> do
-              r <- liftIO $ makeResource (resourceDescriptor manifest)
-              put $ DM.insert (Identity $ resourceDescriptor manifest) r dmap
-              return r
-          Just r -> return r
-        y <- liftIO $ mget manifest (resource rsrc) (mdomainDump manifest x)
-        case y of
-          Nothing -> next Nothing
-          Just y' -> next (mrangePull manifest y')
-      MAssign manifest x y next -> do
-        dmap <- get
-        rsrc <- case DM.lookup (Identity $ resourceDescriptor manifest) dmap of
-          Nothing -> do
-              r <- liftIO $ makeResource (resourceDescriptor manifest)
-              put $ DM.insert (Identity $ resourceDescriptor manifest) r dmap
-              return r
-          Just r -> return r
-        let y' = mrangeDump manifest <$> y
-        liftIO $ mset manifest (resource rsrc) (mdomainDump manifest x) y'
-        next
+      MPure action -> action
+      MAt pf x nextAction -> runPFGet pf x >>= nextAction
+      MAssign pf x y next -> runPFSet pf x y >> next
 
 -- Moving forward: we need a custom monad which is
 --   IO
@@ -347,19 +452,26 @@ instance Manifest SQLiteManifest where
 
 instance ManifestRead SQLiteManifest where
   mget (SQLiteManifest _ tableName) conn key = do
-    y <- query conn "SELECT \"2\" FROM test WHERE 1=1 OR \"1\"=?" (Only key) :: IO [Only T.Text]
+    y <- query conn "SELECT \"2\" FROM test WHERE \"1\"=?" (Only key) :: IO [Only T.Text]
     return $ case y of
       [] -> Nothing
       (y' : _) -> Just (fromOnly y')
 
 pm :: PureManifest MNotInjective ReadOnly Bool String
-pm = PureManifest (\x -> Just $ show x)
+pm = PureManifest (\x -> Just $ if x then "foo" else "bar")
 
 sq :: SQLiteManifest MNotInjective ReadOnly String String
 sq = SQLiteManifest (SQLD "./test1.db") "test"
 
-exampleTerm :: M (Maybe String)
-exampleTerm = do
-  foo <- pm `at` True
-  bar <- sq `at` "foo"
+pf1 = Normal $ PFN pm
+
+pf2 = Normal $ PFN sq
+
+exampleTerm1 :: M (Maybe String)
+exampleTerm1 = do
+  foo <- pf1 `at` True
+  bar <- pf2 `at` "foo"
   return $ (++) <$> foo <*> bar
+
+exampleTerm2 :: M (Maybe String)
+exampleTerm2 = (pf1 ~> pf2) `at` False

@@ -63,7 +63,7 @@ type family DependentMapFunction (t :: *) (a :: *) :: *
 data DependentMap :: * -> (* -> *) -> (* -> *) -> * where
   DependentMapNil :: DependentMap t k v
   DependentMapCons
-    :: ( Ord (k a)
+    :: ( Eq (k a)
        , Typeable a
        , b ~ DependentMapFunction t a
        )
@@ -77,7 +77,7 @@ empty = DependentMapNil
 
 singleton
   :: forall t k v a b .
-     ( Ord (k a)
+     ( Eq (k a)
      , Typeable a
      , b ~ DependentMapFunction t a
      )
@@ -88,7 +88,6 @@ singleton key val = DependentMapCons key val empty
 
 insert
   :: ( Eq (k a)
-     , Ord (k a)
      , Typeable a
      , b ~ DependentMapFunction t a
      )
@@ -104,7 +103,7 @@ insert key val dmap = case dmap of
 
 alter
   :: forall t k v a b .
-     ( Ord (k a)
+     ( Eq (k a)
      , Typeable a
      , b ~ DependentMapFunction t a
      )
@@ -156,7 +155,7 @@ foldWithKey
      (
      )
   => ( forall a b .
-       ( Ord (k a)
+       ( Eq (k a)
        , Typeable a
        , b ~ DependentMapFunction t a
        )
